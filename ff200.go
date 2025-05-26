@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-
 	"net/http"
 	"sync"
 	"time"
@@ -24,6 +23,8 @@ type Options struct {
 	Password string
 }
 
+// Run attempts to fetch the URL using all provided SOCKS5 proxies concurrently.
+// It returns the response body and the address of the proxy that succeeded first with HTTP 200 OK.
 func Run(proxies []string, url string, opts ...*Options) ([]byte, string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -47,7 +48,12 @@ func Run(proxies []string, url string, opts ...*Options) ([]byte, string, error)
 				return
 			}
 
-			netDialer := dialer.(proxy.ContextDialer)
+			netDialer, ok := dialer.(proxy.ContextDialer)
+			if !ok {
+				results <- fetchResult{"", nil, fmt.Errorf("dialer does not support context: %s", addr)}
+				return
+			}
+
 			httpTransport := &http.Transport{
 				DialContext:         netDialer.DialContext,
 				TLSHandshakeTimeout: 10 * time.Second,
@@ -80,12 +86,13 @@ func Run(proxies []string, url string, opts ...*Options) ([]byte, string, error)
 			if resp.StatusCode == 200 {
 				var reader io.Reader = resp.Body
 				if resp.Header.Get("Content-Encoding") == "gzip" {
-					reader, err = gzip.NewReader(resp.Body)
+					gzipReader, err := gzip.NewReader(resp.Body)
 					if err != nil {
 						results <- fetchResult{"", nil, fmt.Errorf("failed to create gzip reader for %s: %v", addr, err)}
 						return
 					}
-					defer reader.(io.Closer).Close()
+					defer gzipReader.Close()
+					reader = gzipReader
 				}
 
 				body, err := io.ReadAll(reader)
@@ -93,6 +100,7 @@ func Run(proxies []string, url string, opts ...*Options) ([]byte, string, error)
 					results <- fetchResult{"", nil, fmt.Errorf("failed to read body from %s: %v", addr, err)}
 					return
 				}
+
 				results <- fetchResult{addr, body, nil}
 				return
 			}

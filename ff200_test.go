@@ -1,6 +1,8 @@
 package ff200
 
 import (
+	"encoding/json"
+
 	"testing"
 )
 
@@ -16,4 +18,8 @@ func TestRun(t *testing.T) {
 		t.Error("Expected non-empty response body")
 	}
 	t.Logf("Success via proxy: %s, received %d bytes", proxy, len(body))
+}
+func isValidJSON(s string) bool {
+	var js json.RawMessage
+	return json.Unmarshal([]byte(s), &js) == nil
 }
