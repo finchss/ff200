@@ -1,10 +1,11 @@
 package ff200
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
-	"net"
+
 	"net/http"
 	"sync"
 	"time"
@@ -18,11 +19,19 @@ type fetchResult struct {
 	err   error
 }
 
-// Run attempts to fetch the URL using all provided SOCKS5 proxies concurrently.
-// It returns the response body and the address of the proxy that succeeded first with HTTP 200 OK.
-func Run(proxies []string, url string) ([]byte, string, error) {
+type Options struct {
+	Username string
+	Password string
+}
+
+func Run(proxies []string, url string, opts ...*Options) ([]byte, string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	var opt *Options
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 
 	results := make(chan fetchResult, len(proxies))
 	var wg sync.WaitGroup
@@ -40,10 +49,7 @@ func Run(proxies []string, url string) ([]byte, string, error) {
 
 			netDialer := dialer.(proxy.ContextDialer)
 			httpTransport := &http.Transport{
-				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-					// Do not resolve locally, let SOCKS5 proxy resolve the hostname
-					return netDialer.DialContext(ctx, network, address)
-				},
+				DialContext:         netDialer.DialContext,
 				TLSHandshakeTimeout: 10 * time.Second,
 			}
 
@@ -58,6 +64,12 @@ func Run(proxies []string, url string) ([]byte, string, error) {
 				return
 			}
 
+			req.Header.Set("Accept-Encoding", "gzip, deflate")
+
+			if opt != nil && opt.Username != "" && opt.Password != "" {
+				req.SetBasicAuth(opt.Username, opt.Password)
+			}
+
 			resp, err := client.Do(req)
 			if err != nil {
 				results <- fetchResult{"", nil, err}
@@ -66,7 +78,17 @@ func Run(proxies []string, url string) ([]byte, string, error) {
 			defer resp.Body.Close()
 
 			if resp.StatusCode == 200 {
-				body, err := io.ReadAll(resp.Body)
+				var reader io.Reader = resp.Body
+				if resp.Header.Get("Content-Encoding") == "gzip" {
+					reader, err = gzip.NewReader(resp.Body)
+					if err != nil {
+						results <- fetchResult{"", nil, fmt.Errorf("failed to create gzip reader for %s: %v", addr, err)}
+						return
+					}
+					defer reader.(io.Closer).Close()
+				}
+
+				body, err := io.ReadAll(reader)
 				if err != nil {
 					results <- fetchResult{"", nil, fmt.Errorf("failed to read body from %s: %v", addr, err)}
 					return
@@ -86,7 +108,7 @@ func Run(proxies []string, url string) ([]byte, string, error) {
 
 	for res := range results {
 		if res.err == nil {
-			cancel() // cancel other requests
+			cancel()
 			return res.body, res.proxy, nil
 		}
 	}
