@@ -14,10 +14,9 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-type fetchResult struct {
-	proxy string
-	body  []byte
-	err   error
+type Result struct {
+	Body  []byte
+	Proxy string
 }
 
 type Options struct {
@@ -27,146 +26,179 @@ type Options struct {
 	Timeout  time.Duration
 }
 
-// Run attempts to fetch the URL using all provided SOCKS5 proxies concurrently.
-// It returns the response body and the address of the proxy that succeeded first with HTTP 200 OK.
 func Run(proxies []string, url string, opts ...*Options) ([]byte, string, error) {
-	l := log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
-
-	var opt *Options
-	if len(opts) > 0 {
-		opt = opts[0]
-	} else {
-		l.Printf("No options provided, using default options\n")
-		opt = &Options{
-			Timeout: 30 * time.Second,
-		}
-	}
-
 	if len(proxies) == 0 {
 		return nil, "", fmt.Errorf("no proxies provided")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	opt := getOptions(opts)
+	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), opt.Timeout)
 	defer cancel()
 
-	results := make(chan fetchResult, len(proxies))
+	resultCh := make(chan Result, 1)
 	var wg sync.WaitGroup
+
+	// Collect all transports so we can close them
+	transports := make([]*http.Transport, 0, len(proxies))
+	var transportMu sync.Mutex
 
 	for _, proxyAddr := range proxies {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
-			if opt.Debug {
-				l.Printf("Attempting to fetch %s via %s\n", url, addr)
+			transport := fetchViaProxy(ctx, addr, url, opt, logger, resultCh)
+			if transport != nil {
+				transportMu.Lock()
+				transports = append(transports, transport)
+				transportMu.Unlock()
 			}
-			dialer, err := proxy.SOCKS5("tcp", addr, nil, proxy.Direct)
-			if err != nil {
-				if opt.Debug {
-					l.Printf("Failed to create dialer for %s: %v\n", addr, err)
-				}
-				results <- fetchResult{"", nil, fmt.Errorf("failed to create dialer for %s: %v", addr, err)}
-				return
-			}
-
-			netDialer, ok := dialer.(proxy.ContextDialer)
-			if !ok {
-				if opt.Debug {
-					l.Printf("dialer does not support context: %s\n", addr)
-				}
-				results <- fetchResult{"", nil, fmt.Errorf("dialer does not support context: %s", addr)}
-				return
-			}
-
-			httpTransport := &http.Transport{
-				DialContext:         netDialer.DialContext,
-				TLSHandshakeTimeout: opt.Timeout,
-				DisableKeepAlives:   true,
-			}
-
-			client := &http.Client{
-				Transport: httpTransport,
-				Timeout:   opt.Timeout,
-			}
-
-			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-			if err != nil {
-				if opt.Debug {
-					l.Printf("Failed to create request for %s: %v\n", addr, err)
-				}
-				results <- fetchResult{"", nil, err}
-				return
-			}
-
-			req.Header.Set("Accept-Encoding", "gzip, deflate")
-
-			if opt != nil && opt.Username != "" && opt.Password != "" {
-				req.SetBasicAuth(opt.Username, opt.Password)
-				if opt.Debug {
-					l.Printf("Using basic auth for %s\n", addr)
-				}
-			}
-
-			resp, err := client.Do(req)
-			if err != nil {
-				if opt.Debug {
-					l.Printf("Failed to fetch %s via %s: %v\n", url, addr, err)
-				}
-				results <- fetchResult{"", nil, err}
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == 200 {
-				var reader io.Reader = resp.Body
-				if resp.Header.Get("Content-Encoding") == "gzip" {
-					if opt.Debug {
-						l.Printf("Got header from %s: Content-Encoding: gzip\n", proxyAddr)
-					}
-					gzipReader, err := gzip.NewReader(resp.Body)
-					if err != nil {
-						if opt.Debug {
-							l.Printf("Failed to create gzip reader from %s: %v\n", proxyAddr, err)
-						}
-						results <- fetchResult{"", nil, fmt.Errorf("failed to create gzip reader for %s: %v", addr, err)}
-						return
-					}
-					defer gzipReader.Close()
-					reader = gzipReader
-				}
-
-				body, err := io.ReadAll(reader)
-				if err != nil {
-					if opt.Debug {
-						l.Printf("Failed to read body from %s: %v\n", proxyAddr, err)
-					}
-					results <- fetchResult{"", nil, fmt.Errorf("failed to read body from %s: %v", addr, err)}
-					return
-				}
-
-				results <- fetchResult{addr, body, nil}
-				return
-			}
-			if opt.Debug {
-				l.Printf("Got non-200 status from %s: %d\n", proxyAddr, resp.StatusCode)
-			}
-			results <- fetchResult{"", nil, fmt.Errorf("non-200 status from %s: %d", addr, resp.StatusCode)}
 		}(proxyAddr)
 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	// Wait for first success or timeout
+	var result Result
+	var hasResult bool
 
-	for res := range results {
-		if res.err == nil {
-			if opt.Debug {
-				l.Printf("Success via proxy: %s, received %d bytes\n", res.proxy, len(res.body))
-			}
-			cancel()
-			return res.body, res.proxy, nil
+	select {
+	case result = <-resultCh:
+		hasResult = true
+		cancel() // Stop other goroutines
+	case <-ctx.Done():
+		// Timeout
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+
+	// Explicitly close all transports to clean up goroutines
+	transportMu.Lock()
+	for _, t := range transports {
+		t.CloseIdleConnections()
+	}
+	transportMu.Unlock()
+
+	if hasResult {
+		return result.Body, result.Proxy, nil
+	}
+
+	return nil, "", fmt.Errorf("all proxies failed or timed out")
+}
+
+func fetchViaProxy(ctx context.Context, proxyAddr, url string, opt *Options, logger *log.Logger, resultCh chan<- Result) *http.Transport {
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	if opt.Debug {
+		logger.Printf("Attempting %s via %s", url, proxyAddr)
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		if opt.Debug {
+			logger.Printf("Failed to create dialer for %s: %v", proxyAddr, err)
+		}
+		return nil
+	}
+
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		if opt.Debug {
+			logger.Printf("Dialer doesn't support context: %s", proxyAddr)
+		}
+		return nil
+	}
+
+	transport := &http.Transport{
+		DialContext:           contextDialer.DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		DisableKeepAlives:     true,
+		MaxIdleConns:          -1, // Disable connection pooling entirely
+		MaxIdleConnsPerHost:   -1,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       1 * time.Millisecond,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   opt.Timeout,
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		if opt.Debug {
+			logger.Printf("Failed to create request for %s: %v", proxyAddr, err)
+		}
+		return transport
+	}
+
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	if opt.Username != "" && opt.Password != "" {
+		req.SetBasicAuth(opt.Username, opt.Password)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if opt.Debug {
+			logger.Printf("Request failed via %s: %v", proxyAddr, err)
+		}
+		return transport
+	}
+	defer resp.Body.Close()
+
+	if ctx.Err() != nil {
+		if opt.Debug {
+			logger.Printf("Context cancelled while processing %s", proxyAddr)
+		}
+		return transport
+	}
+
+	if resp.StatusCode != 200 {
+		if opt.Debug {
+			logger.Printf("Non-200 status from %s: %d", proxyAddr, resp.StatusCode)
+		}
+		return transport
+	}
+
+	body, err := readBody(resp, opt.Debug, logger, proxyAddr)
+	if err != nil {
+		if opt.Debug {
+			logger.Printf("Failed to read body from %s: %v", proxyAddr, err)
+		}
+		return transport
+	}
+
+	select {
+	case resultCh <- Result{Body: body, Proxy: proxyAddr}:
+		if opt.Debug {
+			logger.Printf("Success via %s (%d bytes)", proxyAddr, len(body))
+		}
+	default:
+		if opt.Debug {
+			logger.Printf("Lost race: %s", proxyAddr)
 		}
 	}
 
-	return nil, "", fmt.Errorf("all proxy requests failed or returned non-200")
+	return transport
+}
+
+func readBody(resp *http.Response, debug bool, logger *log.Logger, proxyAddr string) ([]byte, error) {
+	var reader io.Reader = resp.Body
+
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		if debug {
+			logger.Printf("Decompressing gzip from %s", proxyAddr)
+		}
+		gzipReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer gzipReader.Close()
+		reader = gzipReader
+	}
+
+	return io.ReadAll(reader)
 }
