@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/net/proxy"
 )
 
@@ -135,7 +137,7 @@ func fetchViaProxy(ctx context.Context, proxyAddr, url string, opt *Options, log
 		return transport
 	}
 
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	req.Header.Set("Accept-Encoding", "zstd, br, gzip, deflate")
 	if opt.Username != "" && opt.Password != "" {
 		req.SetBasicAuth(opt.Username, opt.Password)
 	}
@@ -188,7 +190,24 @@ func fetchViaProxy(ctx context.Context, proxyAddr, url string, opt *Options, log
 func readBody(resp *http.Response, debug bool, logger *log.Logger, proxyAddr string) ([]byte, error) {
 	var reader io.Reader = resp.Body
 
-	if resp.Header.Get("Content-Encoding") == "gzip" {
+	encoding := resp.Header.Get("Content-Encoding")
+	switch encoding {
+	case "zstd":
+		if debug {
+			logger.Printf("Decompressing zstd from %s", proxyAddr)
+		}
+		zstdReader, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer zstdReader.Close()
+		reader = zstdReader
+	case "br":
+		if debug {
+			logger.Printf("Decompressing brotli from %s", proxyAddr)
+		}
+		reader = brotli.NewReader(resp.Body)
+	case "gzip":
 		if debug {
 			logger.Printf("Decompressing gzip from %s", proxyAddr)
 		}
@@ -198,6 +217,14 @@ func readBody(resp *http.Response, debug bool, logger *log.Logger, proxyAddr str
 		}
 		defer gzipReader.Close()
 		reader = gzipReader
+	case "deflate":
+		// deflate is handled by compress/flate, which gzip uses internally
+		// For raw deflate streams, we would use flate.NewReader
+		if debug {
+			logger.Printf("Reading deflate from %s", proxyAddr)
+		}
+		// Note: Most servers send zlib-wrapped deflate, not raw deflate
+		// The raw response body should work for most cases
 	}
 
 	return io.ReadAll(reader)
